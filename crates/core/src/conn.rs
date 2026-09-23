@@ -96,7 +96,7 @@ cfg_feature! {
 cfg_feature! {
     #![feature = "quinn"]
     pub mod quinn;
-    pub use self::quinn::{QuinnListener, QuinnConnection};
+    pub use self::quinn::{QuinnConnecting, QuinnConnection, QuinnListener};
 }
 cfg_feature! {
     #![all(feature = "unix", unix)]

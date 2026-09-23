@@ -12,7 +12,7 @@ use salvo_http3::quinn::Endpoint;
 use salvo_http3::quinn::quinn::Incoming;
 use tokio_util::sync::CancellationToken;
 
-use super::{QuinnConnection, QuinnCoupler};
+use super::{QuinnConnecting, QuinnCoupler};
 use crate::Error;
 use crate::conn::quinn::ServerConfig;
 use crate::conn::{Accepted, Acceptor, Holding, IntoConfigStream, Listener};
@@ -168,7 +168,7 @@ impl Drop for QuinnAcceptor {
 
 impl Acceptor for QuinnAcceptor {
     type Coupler = QuinnCoupler;
-    type Stream = QuinnConnection;
+    type Stream = QuinnConnecting;
 
     fn holdings(&self) -> &[Holding] {
         &self.holdings
@@ -209,29 +209,21 @@ impl Acceptor for QuinnAcceptor {
                 },
                 None => None,
             };
-            // Admission passed: take the incoming back to complete the handshake below.
-            //
-            // NOTE: the handshake await that follows is not itself cancellation-safe — if this
-            // future is dropped mid-handshake the connection is lost. Parking a mid-flight
-            // handshake future is materially more involved; only the admission phase is parked
-            // here, which closes the gap the async `FusePolicy` introduced.
+            // Admission passed. Start the handshake and hand the connection over at once; the
+            // coupler finishes the handshake on the connection's own task. Awaiting it here
+            // would stall every other accept (TCP included, via `JoinedListener`) for a round
+            // trip, and would lose the connection whenever this future is dropped mid-handshake.
             let new_conn = self.pending.take().expect("incoming parked above");
-            // Of the fuse timeouts, QUIC enforces the handshake timeout here and the
-            // request-body timeout via the H3 body. The transport idle and write-stall
+            // Of the fuse timeouts, QUIC enforces the handshake timeout in `QuinnConnecting` and
+            // the request-body timeout via the H3 body. The transport idle and write-stall
             // timeouts are TCP/byte-stream concepts handled by `StraightStream`; QUIC relies on
             // quinn's own `max_idle_timeout` and per-stream flow control instead (see the
             // `FuseConfig` field docs).
-            let connected = match fuse_config.and_then(|config| config.tls_handshake_timeout) {
-                Some(timeout) => match tokio::time::timeout(timeout, new_conn).await {
-                    Ok(result) => result,
-                    Err(_) => continue,
-                },
-                None => new_conn.await,
-            };
-            return match connected {
-                Ok(conn) => Ok(Accepted {
+            let handshake_timeout = fuse_config.and_then(|config| config.tls_handshake_timeout);
+            return match new_conn.accept() {
+                Ok(connecting) => Ok(Accepted {
                     coupler: QuinnCoupler,
-                    stream: QuinnConnection::new(conn),
+                    stream: QuinnConnecting::new(connecting, handshake_timeout),
                     fuse_config,
                     conn_ctrl: crate::conn::ConnCtrl::new(),
                     local_addr: self.holdings[0].local_addr.clone(),
